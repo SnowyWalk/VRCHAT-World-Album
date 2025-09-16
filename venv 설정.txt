@@ -1,0 +1,6 @@
+venv 위치
+cd ~/booth-dog/VRCHATWorldAlbum
+source .venv/bin/activate
+
+서버 실행
+uvicorn app:app --host 0.0.0.0 --port 8080

@@ -1,0 +1,1 @@
+ssh -i "D:\Private Key\20201009 pem.pem" ubuntu@ec2-54-180-100-228.ap-northeast-2.compute.amazonaws.com
