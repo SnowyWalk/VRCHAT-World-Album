@@ -1,36 +1,42 @@
-import os, re, time, json, asyncio, pathlib, io
+import os, re, time, json, asyncio, pathlib
 from typing import Dict, Any, Tuple, List
 from datetime import datetime
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # ===== 설정 =====
 PORT = int(os.getenv("PORT", "8080"))
 CACHE_TTL = int(os.getenv("CACHE_TTL", str(24 * 60 * 60)))  # 24시간
+MANIFEST_TTL = int(os.getenv("MANIFEST_TTL", "60"))  # /api/worlds 캐시 TTL
 USER_AGENT = os.getenv("USER_AGENT", "VRC-World-Site/1.3")
 UPSTREAM_BASE = "https://api.vrchat.cloud/api/1/worlds/"
 WORLD_ID_RE = re.compile(r"^wrld_[0-9a-f-]{8,}$", re.I)
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 # 썸네일 설정
-THUMB_WIDTH = int(os.getenv("THUMB_WIDTH", "480"))   # 썸네일 가로(px)
+THUMB_WIDTH = int(os.getenv("THUMB_WIDTH", "480"))
 THUMB_QUALITY = int(os.getenv("THUMB_QUALITY", "82"))
-USE_WEBP = os.getenv("THUMB_WEBP", "1") == "1"       # webp로 저장
-VIEW_WIDTH = int(os.getenv("VIEW_WIDTH", "1600")) # 라이트박스용 가로 px
+USE_WEBP = os.getenv("THUMB_WEBP", "1") == "1"
+VIEW_WIDTH = int(os.getenv("VIEW_WIDTH", "1600"))
 VIEW_QUALITY = int(os.getenv("VIEW_QUALITY", "88"))
 
 ROOT = pathlib.Path(__file__).parent.resolve()
 STATIC_DIR = ROOT / "static"
 WORLDS_ROOT = STATIC_DIR / "worlds"
-THUMBS_ROOT = STATIC_DIR / "_thumbs"  # 생성/캐시 위치
+THUMBS_ROOT = STATIC_DIR / "_thumbs"
 VIEWS_ROOT = STATIC_DIR / "_views"
 
 # 캐시: worldId -> (expire_ts, data)
 _cache: Dict[str, Tuple[float, Any]] = {}
 _locks: Dict[str, asyncio.Lock] = {}
 http_client: httpx.AsyncClient | None = None
+
+# /api/worlds 결과 캐시
+_manifest_cache = {"data": None, "etag": None, "exp": 0}
+# txt 설명 캐시
+_desc_cache: Dict[str, Tuple[float, str]] = {}
 
 app = FastAPI(title="VRC World Site")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=False), name="static")
@@ -50,7 +56,7 @@ async def _startup():
     global http_client
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(10.0),
-        headers={"Accept":"application/json","User-Agent":USER_AGENT},
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
     )
     WORLDS_ROOT.mkdir(parents=True, exist_ok=True)
     THUMBS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -113,81 +119,90 @@ async def get_world_with_cache(world_id: str):
         cache_set(world_id, data3)
         return data3
 
-# ---- 파일 시스템 스캔 ----
+# ---- 파일 시스템 ----
 def list_world_dirs() -> List[pathlib.Path]:
     if not WORLDS_ROOT.exists(): return []
     return [p for p in WORLDS_ROOT.iterdir() if p.is_dir() and WORLD_ID_RE.match(p.name or "")]
 
-def dir_timestamp(p: pathlib.Path) -> float:
-    st = p.stat()
-    base = getattr(st, "st_birthtime", None)
-    base = float(base) if base else float(st.st_mtime)
-    latest_file_ts = 0.0
-    try:
-        for f in p.iterdir():
-            if f.is_file():
-                latest_file_ts = max(latest_file_ts, float(f.stat().st_mtime))
-    except Exception:
-        pass
-    return max(base, latest_file_ts)
-
-def list_photo_files(world_dir: pathlib.Path) -> List[pathlib.Path]:
-    files = []
-    try:
-        for f in sorted(world_dir.iterdir()):
-            if f.is_file() and f.suffix.lower() in ALLOWED_EXT:
-                files.append(f)
-    except Exception:
-        pass
-    return files
-
 def read_local_desc(world_dir: pathlib.Path) -> str:
-    """
-    월드 폴더 내 .txt 파일을 하나 골라 내용을 설명으로 사용.
-    없으면 빈 문자열 반환.
-    """
+    """폴더 내 txt 파일 1개를 읽어서 설명으로 사용. 없으면 ''. mtime 캐시."""
     try:
-        if not world_dir.exists():
-            return ""
-        # 폴더 안의 .txt 파일 중 사전순으로 첫 번째 선택
-        cands = sorted(
-            [p for p in world_dir.iterdir() if p.is_file() and p.suffix.lower() == ".txt"],
-            key=lambda p: p.name.lower()
-        )
-        if not cands:
-            return ""
-        data = cands[0].read_bytes()
-        # 인코딩 추정 (utf-8 우선, 그 다음 흔한 한글 인코딩)
+        txts = sorted([p for p in world_dir.iterdir() if p.is_file() and p.suffix.lower() == ".txt"],
+                      key=lambda p: p.name.lower())
+        if not txts: return ""
+        f = txts[0]
+        mtime = f.stat().st_mtime
+        key = str(f.resolve())
+        cached = _desc_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        data = f.read_bytes()
         for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
             try:
-                return data.decode(enc).strip()
+                text = data.decode(enc).strip()
+                _desc_cache[key] = (mtime, text)
+                return text
             except Exception:
                 continue
-        # 마지막 폴백: 손실 감수하고 utf-8로 디코드
-        return data.decode("utf-8", "ignore").strip()
+        text = data.decode("utf-8", "ignore").strip()
+        _desc_cache[key] = (mtime, text)
+        return text
     except Exception:
         return ""
 
-# ---- 썸네일 생성/서빙 ----
+def scan_world_dir(world_dir: pathlib.Path) -> dict:
+    """한 번의 iterdir로 addedTs, 사진 목록, 로컬 txt 설명 수집."""
+    info = {"addedTs": 0.0, "photos": [], "desc": "", "photo_count": 0}
+    if not world_dir.exists(): return info
+
+    latest_file_ts = 0.0
+    image_files, txt_file = [], None
+    try:
+        for f in world_dir.iterdir():
+            if not f.is_file(): continue
+            ext = f.suffix.lower()
+            latest_file_ts = max(latest_file_ts, float(f.stat().st_mtime))
+            if ext == ".txt" and txt_file is None:
+                txt_file = f
+            elif ext in ALLOWED_EXT:
+                image_files.append(f)
+    except Exception:
+        pass
+
+    try:
+        st = world_dir.stat()
+        base = getattr(st, "st_birthtime", None)
+        base = float(base) if base else float(st.st_mtime)
+    except Exception:
+        base = 0.0
+    info["addedTs"] = max(base, latest_file_ts)
+
+    wid = world_dir.name
+    for p in sorted(image_files, key=lambda x: x.name.lower()):
+        rel = p.relative_to(STATIC_DIR).as_posix()
+        info["photos"].append({
+            "full": "/static/" + rel,
+            "thumb": f"/thumbs/{wid}/{p.name}",
+            "view": f"/view/{wid}/{p.name}",
+        })
+    info["photo_count"] = len(info["photos"])
+    info["desc"] = read_local_desc(world_dir) if txt_file else ""
+    return info
+
+# ---- 이미지 리사이즈 ----
 def thumb_target_path(src: pathlib.Path) -> pathlib.Path:
-    wid = src.parent.name
-    stem = src.stem # 확장자 제거 이름
+    wid, stem = src.parent.name, src.stem
     ext = ".webp" if USE_WEBP else src.suffix.lower()
     dst_dir = THUMBS_ROOT / wid
     dst_dir.mkdir(parents=True, exist_ok=True)
     return dst_dir / f"{stem}{ext}"
-    
+
 def view_target_path(src: pathlib.Path) -> pathlib.Path:
-    wid = src.parent.name
-    stem = src.stem
+    wid, stem = src.parent.name, src.stem
     ext = ".webp" if USE_WEBP else src.suffix.lower()
     dst_dir = VIEWS_ROOT / wid
     dst_dir.mkdir(parents=True, exist_ok=True)
     return dst_dir / f"{stem}{ext}"
-
-def make_thumb_if_needed(src: pathlib.Path) -> pathlib.Path:
-    dst = thumb_target_path(src)
-    return _ensure_resized(src, dst, THUMB_WIDTH, THUMB_QUALITY, USE_WEBP)
 
 def _ensure_resized(src: pathlib.Path, dst: pathlib.Path, width: int, quality: int, force_webp: bool):
     from PIL import Image, ImageOps
@@ -206,34 +221,32 @@ def _ensure_resized(src: pathlib.Path, dst: pathlib.Path, width: int, quality: i
                     params = dict(format="JPEG", quality=quality, optimize=True)
                 im.save(dst, **params)
     except Exception:
-        # 실패 시 원본 복사 경로로 대체
         return src
     return dst
 
 @app.get("/thumbs/{world_id}/{filename:path}")
 def get_thumb(world_id: str, filename: str):
-    # filename 예: 01.jpg
     src = WORLDS_ROOT / world_id / filename
     if not src.exists() or not src.is_file():
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)
     if src.suffix.lower() not in ALLOWED_EXT:
-        raise HTTPException(status_code=400, detail="unsupported file type")
-    dst = make_thumb_if_needed(src)
+        raise HTTPException(status_code=400)
+    dst = thumb_target_path(src)
+    out = _ensure_resized(src, dst, THUMB_WIDTH, THUMB_QUALITY, USE_WEBP)
     media = "image/webp" if (USE_WEBP and src.suffix.lower() != ".webp") else None
-    return FileResponse(dst, media_type=media, headers={"Cache-Control":"public, max-age=604800"})
-#     return FileResponse(dst, headers={"Cache-Control": "public, max-age=604800"})  # 7일
+    return FileResponse(out, media_type=media, headers={"Cache-Control":"public, max-age=604800"})
 
 @app.get("/view/{world_id}/{filename:path}")
 def get_view(world_id: str, filename: str):
     src = WORLDS_ROOT / world_id / filename
     if not src.exists() or not src.is_file():
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)
     if src.suffix.lower() not in ALLOWED_EXT:
-        raise HTTPException(status_code=400, detail="unsupported file type")
+        raise HTTPException(status_code=400)
     dst = view_target_path(src)
     out = _ensure_resized(src, dst, VIEW_WIDTH, VIEW_QUALITY, USE_WEBP)
     media = "image/webp" if (USE_WEBP and src.suffix.lower() != ".webp") else None
-    return FileResponse(out, media_type=media, headers={"Cache-Control": "public, max-age=1209600"}) # 14일
+    return FileResponse(out, media_type=media, headers={"Cache-Control":"public, max-age=1209600"})
 
 # ---- API ----
 @app.get("/healthz")
@@ -241,25 +254,17 @@ async def healthz():
     return {"ok": True, "cache_items": len(_cache), "ttl": CACHE_TTL}
 
 @app.get("/api/world")
-async def api_world(id: str = Query(..., description="VRChat world id (wrld_...)")):
+async def api_world(id: str = Query(...)):
     world_id = id.strip()
     if not WORLD_ID_RE.match(world_id):
-        raise HTTPException(status_code=400, detail="invalid world id")
+        raise HTTPException(status_code=400)
     meta = await get_world_with_cache(world_id)
     world_dir = WORLDS_ROOT / world_id
-    added_ts = dir_timestamp(world_dir) if world_dir.exists() else 0.0
-    photos = []
-    for p in list_photo_files(world_dir):
-        rel = p.relative_to(STATIC_DIR).as_posix()             # /static/worlds/...
-        full = "/static/" + rel
-        thumb = f"/thumbs/{world_id}/{p.name}"
-        photos.append({"full": full, "thumb": thumb, "view": f"/view/{world_id}/{p.name}",})
-    local_desc = read_local_desc(world_dir)
-
+    scan = scan_world_dir(world_dir)
     merged = {
         "id": world_id,
         "name": meta.get("name"),
-        "description": local_desc, # meta.get("description"),
+        "description": scan["desc"],
         "authorName": meta.get("authorName"),
         "favorites": meta.get("favorites"),
         "visits": meta.get("visits"),
@@ -273,44 +278,39 @@ async def api_world(id: str = Query(..., description="VRChat world id (wrld_...)
         "publicationDate": meta.get("publicationDate"),
         "url": f"https://vrchat.com/home/world/{world_id}",
         "tags": meta.get("tags", []),
-        "photos": photos,
-        "addedTs": added_ts,
+        "photos": scan["photos"],
+        "addedTs": scan["addedTs"],
         "authorId": meta.get("authorId"),
     }
     return JSONResponse(content=merged, headers={"Cache-Control": f"public, max-age={CACHE_TTL}"})
 
-@app.get("/api/worlds")
-async def api_worlds():
-    dirs = list_world_dirs()
-    sortable = [(dir_timestamp(d), d) for d in dirs]
-    sortable.sort(key=lambda t: t[0], reverse=True)
+@app.get("/api/photos")
+async def api_photos(id: str = Query(...), limit: int = Query(None, ge=1, le=200)):
+    world_id = id.strip()
+    if not WORLD_ID_RE.match(world_id):
+        raise HTTPException(status_code=400)
+    world_dir = WORLDS_ROOT / world_id
+    scan = scan_world_dir(world_dir)
+    photos = scan["photos"]
+    if limit is not None:
+        photos = photos[:limit]
+    return JSONResponse(content={"photos": photos}, headers={"Cache-Control": "public, max-age=300"})
 
-    results: List[dict] = []
-    for added_ts, d in sortable:
+async def _build_worlds_manifest_async() -> Tuple[dict, str]:
+    dirs = list_world_dirs()
+    items: List[dict] = []
+    for d in dirs:
         wid = d.name
+        scan = scan_world_dir(d)
         try:
             meta = await get_world_with_cache(wid)
         except HTTPException:
-            meta = {"name": wid, "description": "", "authorName": None, "favorites": 0,
-                    "visits": 0, "capacity": None, "heat": None, "popularity": None,
-                    "imageUrl": None, "thumbnailImageUrl": None, "updated_at": None,
-                    "publicationDate": None, "tags": []}
-
-        photos = []
-        for p in list_photo_files(d):
-            rel = p.relative_to(STATIC_DIR).as_posix()
-            photos.append({
-                "full": "/static/" + rel,
-                "thumb": f"/thumbs/{wid}/{p.name}",
-                "view": f"/view/{wid}/{p.name}",
-            })
-        local_desc = read_local_desc(d)
-
-        results.append({
+            meta = {}
+        items.append({
             "id": wid,
             "name": meta.get("name") or wid,
-            "description": local_desc, # meta.get("description") or "",
             "authorName": meta.get("authorName"),
+            "authorId": meta.get("authorId"),
             "favorites": meta.get("favorites"),
             "visits": meta.get("visits"),
             "capacity": meta.get("recommendedCapacity") or meta.get("capacity"),
@@ -323,12 +323,37 @@ async def api_worlds():
             "publicationDate": meta.get("publicationDate"),
             "url": f"https://vrchat.com/home/world/{wid}",
             "tags": meta.get("tags", []),
-            "photos": photos,
-            "addedTs": added_ts,
-            "authorId": meta.get("authorId"),
+            "description": scan["desc"],
+            "addedTs": scan["addedTs"],
+            "photoCount": scan["photo_count"],
+            "previewThumb": (scan["photos"][0]["thumb"] if scan["photo_count"] else None),
         })
+    items.sort(key=lambda x: x.get("addedTs") or 0.0, reverse=True)
+    import hashlib
+    hasher = hashlib.sha1()
+    for it in items:
+        base = f'{it["id"]}:{int(it.get("addedTs") or 0)}:{int(it.get("updatedTs") or 0)}:{int(it.get("photoCount") or 0)}'
+        hasher.update(base.encode("utf-8"))
+    etag = '"' + hasher.hexdigest() + '"'
+    return {"worlds": items}, etag
 
-    return JSONResponse(content={"worlds": results}, headers={"Cache-Control": "no-store"})
+@app.get("/api/worlds")
+async def api_worlds(request: Request):
+    now = time.time()
+    mc = _manifest_cache
+    if mc["data"] is not None and mc["exp"] > now:
+        inm = request.headers.get("if-none-match")
+        if inm and mc["etag"] and inm == mc["etag"]:
+            return Response(status_code=304, headers={"ETag": mc["etag"], "Cache-Control": f"public, max-age={MANIFEST_TTL}"})
+        return JSONResponse(mc["data"], headers={"ETag": mc["etag"], "Cache-Control": f"public, max-age={MANIFEST_TTL}"})
+    payload, etag = await _build_worlds_manifest_async()
+    _manifest_cache["data"] = payload
+    _manifest_cache["etag"] = etag
+    _manifest_cache["exp"] = now + MANIFEST_TTL
+    inm = request.headers.get("if-none-match")
+    if inm and inm == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": f"public, max-age={MANIFEST_TTL}"})
+    return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": f"public, max-age={MANIFEST_TTL}"})
 
 @app.get("/", response_class=HTMLResponse)
 async def root():

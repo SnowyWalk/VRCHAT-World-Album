@@ -42,31 +42,25 @@
             <img id="big" alt="" />
             <button class="hit next" id="hitNext" aria-label="다음 사진 보기"><span class="ico">→</span></button>
         </div>
-        <div id="film" class="film" role="listbox" aria-label="썸네일 목록"></div> <!-- ← 추가 -->
+        <div id="film" class="film" role="listbox" aria-label="썸네일 목록"></div>
         <div id="cap" class="caption"></div>
     </div>
 
     <script>
+        // -------- 공통 유틸 --------
         let _imgReqToken = 0
         const _imgCache = new Map()
         const _thumbCache = new Map()
+        const _photosCache = new Map() // worldId -> [{full,thumb,view}, ...]
         const $ = s => document.querySelector(s)
         const el = (t, p = {}, ...c) =>
         {
             const n = document.createElement(t)
             for (const [k, v] of Object.entries(p))
             {
-                if (k === "class")
-                {
-                    n.className = v
-                } else if (/^on[A-Z]/.test(k) && typeof v === "function")
-                {
-                    // onClick, onKeydown 등 → click, keydown 으로 정규화
-                    n.addEventListener(k.slice(2).toLowerCase(), v)
-                } else if (v != null)
-                {
-                    n.setAttribute(k, v)
-                }
+                if (k === "class") n.className = v
+                else if (/^on[A-Z]/.test(k) && typeof v === "function") n.addEventListener(k.slice(2).toLowerCase(), v)
+                else if (v != null) n.setAttribute(k, v)
             }
             for (const x of c) n.append(x?.nodeType ? x : document.createTextNode(x ?? ""))
             return n
@@ -76,38 +70,62 @@
         const light = $("#lightbox"), big = $("#big"), cap = $("#cap"), bClose = $("#bClose"),
             hitPrev = $("#hitPrev"), hitNext = $("#hitNext"), film = $("#film")
         const sortSel = $("#sortSel"), themeBtn = $("#themeBtn")
-        let STATE = { worlds: [], sort: localStorage.getItem("sort") || "added" };
 
-        /* 테마 토글 */
-        (function initTheme()
+        let STATE = { worlds: [], sort: localStorage.getItem("sort") || "added" }
+
+            // -------- 테마 --------
+            ; (function initTheme()
+            {
+                const saved = localStorage.getItem("theme")
+                if (saved)
+                {
+                    document.documentElement.setAttribute("data-theme", saved)
+                    themeBtn.textContent = saved === "dark" ? "🌙" : "☀️"
+                } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+                {
+                    document.documentElement.setAttribute("data-theme", "light")
+                    themeBtn.textContent = "☀️"
+                }
+                themeBtn.addEventListener("click", () =>
+                {
+                    const cur = document.documentElement.getAttribute("data-theme") || "dark"
+                    const next = cur === "dark" ? "light" : "dark"
+                    document.documentElement.setAttribute("data-theme", next)
+                    localStorage.setItem("theme", next)
+                    themeBtn.textContent = next === "dark" ? "🌙" : "☀️"
+                })
+            })()
+
+        // -------- 라이트박스 --------
+        let currList = [], currIdx = 0, currWorldName = "", currThumbs = []
+
+        async function fetchPhotos(worldId, limit = null)
         {
-            const saved = localStorage.getItem("theme")
-            if (saved)
+            if (_photosCache.has(worldId)) return _photosCache.get(worldId)
+            const url = limit ? `/api/photos?id=${encodeURIComponent(worldId)}&limit=${limit}`
+                : `/api/photos?id=${encodeURIComponent(worldId)}`
+            const r = await fetch(url, { cache: "force-cache" })
+            if (!r.ok) throw new Error("photos fetch " + r.status)
+            const { photos } = await r.json()
+            _photosCache.set(worldId, photos || [])
+            return photos || []
+        }
+
+        async function openLight(listOrWorldId, i = 0, worldName = "", thumbs = null)
+        {
+            let list = []
+            if (Array.isArray(listOrWorldId))
             {
-                document.documentElement.setAttribute("data-theme", saved)
-                themeBtn.textContent = saved === "dark" ? "🌙" : "☀️"
-            } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+                list = listOrWorldId
+            } else
             {
-                document.documentElement.setAttribute("data-theme", "light")
-                themeBtn.textContent = "☀️"
+                const worldId = String(listOrWorldId)
+                const photos = await fetchPhotos(worldId, null)
+                list = photos.map(p => p.view || p.full)
+                thumbs = photos.map(p => p.thumb || p.full)
             }
-            themeBtn.addEventListener("click", () =>
-            {
-                const cur = document.documentElement.getAttribute("data-theme") || "dark"
-                const next = cur === "dark" ? "light" : "dark"
-                document.documentElement.setAttribute("data-theme", next)
-                localStorage.setItem("theme", next)
-                themeBtn.textContent = next === "dark" ? "🌙" : "☀️"
-            })
-        })()
-
-        /* 라이트박스 (버그픽스: 내부 이미지 클릭 시 닫힘 방지, 썸네일→원본 경로 분리) */
-        let currList = [], currIdx = 0, currWorldName = ""
-        let currThumbs = [] // ← 썸네일 경로 배열
-
-        function openLight(list, i = 0, worldName = "", thumbs = null)
-        {
             if (!Array.isArray(list) || list.length === 0) return
+
             document.documentElement.classList.add('lb-open')
             currList = list
             currIdx = Math.max(0, Math.min(i, list.length - 1))
@@ -123,46 +141,35 @@
             renderFilm(currThumbs)
 
             light.setAttribute("open", "")
-            lockScroll()                                      // ✅ 폭 유지한 채 스크롤 고정
+            lockScroll()
             requestAnimationFrame(updateLbReserve)
             preloadThumbNeighbors(currThumbs, currIdx)
             preloadNeighbors(currList, currIdx)
         }
-
         function closeLight()
         {
             light.removeAttribute("open")
             document.documentElement.classList.remove('lb-open')
-            unlockScroll()                                     // ✅ 원복 + 원래 스크롤 위치 복구
+            unlockScroll()
             big.src = ""
             cap.textContent = ""
         }
-
         function move(d)
         {
             if (!currList.length) return
             currIdx = (currIdx + d + currList.length) % currList.length
-            setBigImage(
-                currList[currIdx],
-                `${currWorldName} 사진 ${currIdx + 1}/${currList.length}`,
-                currThumbs[currIdx]               // ← 프리뷰 전달
-            )
+            setBigImage(currList[currIdx], `${currWorldName} 사진 ${currIdx + 1}/${currList.length}`, currThumbs[currIdx])
             cap.textContent = `${currWorldName} · ${currIdx + 1}/${currList.length}`
             updateFilmActive()
             requestAnimationFrame(updateLbReserve)
             preloadThumbNeighbors(currThumbs, currIdx)
             preloadNeighbors(currList, currIdx)
         }
-
         function jumpTo(i)
         {
             if (!currList.length) return
             currIdx = Math.max(0, Math.min(i, currList.length - 1))
-            setBigImage(
-                currList[currIdx],
-                `${currWorldName} 사진 ${currIdx + 1}/${currList.length}`,
-                currThumbs[currIdx]               // ← 프리뷰 전달
-            )
+            setBigImage(currList[currIdx], `${currWorldName} 사진 ${currIdx + 1}/${currList.length}`, currThumbs[currIdx])
             cap.textContent = `${currWorldName} · ${currIdx + 1}/${currList.length}`
             updateFilmActive()
             requestAnimationFrame(updateLbReserve)
@@ -170,47 +177,42 @@
             preloadNeighbors(currList, currIdx)
         }
 
-
         bClose.onclick = closeLight
         hitPrev.onclick = () => move(-1)
         hitNext.onclick = () => move(+1)
-        light.addEventListener("click", e =>
-        {
-            if (e.target === light) closeLight()
-        })
-        big.addEventListener("click", e => e.stopPropagation()) // 내부 클릭은 유지
+        light.addEventListener("click", e => { if (e.target === light) closeLight() })
+        big.addEventListener("click", e => e.stopPropagation())
         film.addEventListener("click", e => e.stopPropagation())
 
-        /* 유틸 */
-        function pct(fav, vis)
+        // 프리뷰 → 원본 스왑(깜빡임 방지)
+        async function setBigImage(fullSrc, altText, previewSrc)
         {
-            const v = Number(vis) || 0
-            const f = Number(fav) || 0
-            if (v <= 0) return "0%"
-            // 이상치 방지: 0~100%로 클램프(+소수 1자리, 10% 이상은 정수)
-            let p = (f / v) * 100
-            if (!isFinite(p)) p = 0
-            p = Math.max(0, Math.min(100, p))
-            return (p >= 10 ? Math.round(p) : p.toFixed(1)) + "%"
-        }
+            const token = ++_imgReqToken
+            big.alt = altText || ""
+            big.setAttribute("fetchpriority", "high")
 
-        function favRatioNum(w)
-        {
-            const v = Number(w.visits) || 0, f = Number(w.favorites) || 0
-            return v > 0 ? f / v : 0
-        }
+            const show = (url) => { if (token === _imgReqToken && big.src !== url) big.src = url }
 
-        function chips(tags)
-        {
-            if (!Array.isArray(tags)) return []
-            return tags.filter(t => t.startsWith("author_tag_"))
-                .map(t => t.replace(/^author_tag_/, ""))
-                .map(txt => el("span", { class: "chip" }, txt))
-        }
+            const fCached = _imgCache.get(fullSrc)
+            if (fCached?.complete && fCached.naturalWidth) { show(fullSrc); return }
 
-        function toTs(v)
-        {
-            return typeof v === "number" ? v : (Date.parse(v || "") || 0)
+            if (previewSrc && previewSrc !== fullSrc && big.src !== previewSrc)
+            {
+                let tImg = _thumbCache.get(previewSrc)
+                if (!tImg)
+                {
+                    tImg = new Image(); tImg.decoding = "async"; tImg.src = previewSrc
+                    _thumbCache.set(previewSrc, tImg)
+                }
+                show(previewSrc)
+            }
+
+            let loader = fCached instanceof Image ? fCached : new Image()
+            loader.decoding = "async"
+            if (!fCached) loader.src = fullSrc
+            try { if (!loader.complete) await loader.decode() } catch (_) { }
+            _imgCache.set(fullSrc, loader)
+            show(fullSrc)
         }
 
         function renderFilm(thumbs)
@@ -223,22 +225,14 @@
                     role: "option",
                     "aria-selected": i === currIdx ? "true" : "false",
                     onClick: () => jumpTo(i),
-                    onKeydown: (e) =>
-                    {
-                        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jumpTo(i) }
-                    }
+                    onKeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jumpTo(i) } }
                 }, el("img", { src, alt: `${currWorldName} 썸네일 ${i + 1}` }))
                 btn.addEventListener("mousedown", e => e.preventDefault())
                 film.append(btn)
             })
-            // 현재 선택 썸네일이 보이도록 스크롤
-            queueMicrotask(() =>
-            {
-                const active = film.querySelector(".t.active")
-                active?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" })
-            })
+            queueMicrotask(() => film.querySelector(".t.active")
+                ?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" }))
         }
-
         function updateFilmActive()
         {
             const nodes = film.querySelectorAll(".t")
@@ -248,248 +242,25 @@
                 n.classList.toggle("active", on)
                 n.setAttribute("aria-selected", on ? "true" : "false")
             })
-            const active = film.querySelector(".t.active")
-            active?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" })
+            film.querySelector(".t.active")
+                ?.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" })
         }
 
-        let _swapTimer = null
-        // 프리뷰 → 원본, 빈 프레임 없이 부드럽게 교체(토큰가드 + decode)
-        async function setBigImage(fullSrc, altText, previewSrc)
-        {
-            const token = ++_imgReqToken
-            big.alt = altText || ""
-            big.setAttribute("fetchpriority", "high")
-
-            const show = (url) =>
-            {
-                if (token !== _imgReqToken) return
-                if (big.src !== url) big.src = url
-            }
-
-            // 1) 원본이 캐시에 완전 로드되어 있으면 즉시 교체
-            const fCached = _imgCache.get(fullSrc)
-            if (fCached?.complete && fCached.naturalWidth)
-            {
-                show(fullSrc)
-                return
-            }
-
-            // 2) 프리뷰를 먼저 보여(반응성↑). 기존 src는 비우지 않음 → 빈 프레임 없음
-            if (previewSrc && previewSrc !== fullSrc && big.src !== previewSrc)
-            {
-                let tImg = _thumbCache?.get(previewSrc)
-                if (!tImg)
-                {
-                    tImg = new Image()
-                    tImg.decoding = "async"
-                    tImg.src = previewSrc
-                    _thumbCache?.set?.(previewSrc, tImg)
-                }
-                show(previewSrc)
-            }
-
-            // 3) 원본 비동기 로드 + decode까지 끝난 뒤 교체(깜빡임 제거)
-            let loader = fCached instanceof Image ? fCached : new Image()
-            loader.decoding = "async"
-            if (!fCached) loader.src = fullSrc
-
-            try
-            {
-                if (!loader.complete) await loader.decode()
-            } catch (_) { /* 실패 시 프리뷰 유지 */ }
-
-            _imgCache.set(fullSrc, loader)
-            show(fullSrc)
-        }
-
-
-
-
-        function updateLbReserve()
-        {
-            // 열린 상태에서 실제 높이를 측정
-            const filmH = light.hasAttribute('open') ? (film?.offsetHeight || 0) : 0
-            const capH = cap?.offsetHeight || 0
-            const btnH = 0 //Math.max(bPrev?.offsetHeight || 0, bNext?.offsetHeight || 0)
-            const margin = 28 // 여유 간격(겹침 방지 버퍼)
-            const reserve = Math.ceil(filmH + Math.max(capH, btnH) + margin)
-            document.documentElement.style.setProperty('--lb-reserve', reserve + 'px')
-        }
-
-        /* 카드 */
-        function card(w)
-        {
-            const url = w.url
-            const author = w.authorName || ""
-            const heroImg = el("img", {
-                src: w.imageUrl || w.thumbnailImageUrl || "",
-                alt: `${w.name} 썸네일`,
-                loading: "lazy",
-                decoding: "async"
-            })
-            const hero = el("a", { class: "hero", href: url, target: "_blank", rel: "noopener noreferrer" }, heroImg)
-            const title = el("a", {
-                href: url,
-                target: "_blank",
-                rel: "noopener noreferrer",
-                class: "title"
-            }, w.name || w.id)
-
-            let authorAttr = null
-            if (w.authorName)
-            {
-                const linkNode = w.authorId
-                    ? el("a", {
-                        href: `https://vrchat.com/home/user/${w.authorId}`,
-                        target: "_blank",
-                        rel: "noopener noreferrer",
-                        class: "author-link"
-                    }, w.authorName)
-                    : el("span", { class: "author-link" }, w.authorName)
-
-                authorAttr = el("div",
-                    // { class: "stat-row author-attr" },
-                    // el("span", { class: "label" }, "제작자 "),
-                    { class: "author-attr" },
-                    linkNode
-                )
-            }
-
-            const titleLine = el("div", { class: "title-line" }, title, authorAttr)
-            const stats1 = el("div", { class: "stat-row" }, `방문 ${w.visits.toLocaleString("en-US") ?? 0}`)
-
-            // 즐겨찾기 + 미니 히트맵(오른쪽 게이지)
-            const ratio = favRatioNum(w) // 0~1
-            const stats2 = el("div", { class: "stat-row favrow" },
-                el("span", {}, `즐겨찾기 ${Number(w.favorites || 0).toLocaleString("en-US")}`),
-                el("span", { class: "mini-pct" }, pct(w.favorites, w.visits)),
-                (() =>
-                {
-                    const m = el("span", { class: "mini" },
-                        el("span", { class: "mini-bar" })
-                    )
-                    m.querySelector(".mini-bar")
-                        .style.setProperty("--ratio", String(Math.max(0, Math.min(1, ratio))))
-                    return m
-                })()
-            )
-
-
-
-            const capRow = el("div", { class: "meta" }, `최대 인원 ${w.capacity ?? "-"}`)
-            const hpRow = el("div", { class: "icons" },
-                el("span", { class: "icon" }, `${repeatString("🔥 ", Number(w.heat ?? 1))} `, String(w.heat ?? "-")),
-                el("span", { class: "icon" }, `${repeatString("⭐", Number(w.popularity ?? 1))} `, String(w.popularity ?? "-"))
-            )
-            const tagWrap = el("div", { class: "tags" }, ...chips(w.tags))
-            const desc = el("p", { class: "desc" }, (w.description || "").trim())
-
-            // 스냅샷
-            const maxThumbs = 6
-            const strip = el("div", { class: "strip" })
-
-
-            const photos = Array.isArray(w.photos) ? w.photos : []
-            // 각 항목은 문자열 또는 {full,thumb,view}
-            const norm = photos.map(p => typeof p === "string" ? { full: p, thumb: p, view: p } : {
-                full: p.full, thumb: p.thumb || p.full, view: p.view || p.full
-            })
-            const fullList = norm.map(p => p.view)
-            const thumbList = norm.map(p => p.thumb)
-
-
-            photos.slice(0, maxThumbs).forEach((p, i) =>
-            {
-                const thumbSrc = (typeof p === "string") ? p : (p.thumb || p.full)
-                const isLast = i === maxThumbs - 1 && photos.length > maxThumbs
-                const open = () => openLight(fullList, i, w.name || w.id, thumbList)
-
-
-                if (isLast)
-                {
-                    const remain = photos.length - maxThumbs + 1
-                    strip.append(
-                        el("div", { class: "more", "data-more": "+ " + remain, role: "button", tabindex: "0", onClick: open },
-                            el("img", {
-                                class: "thumb",
-                                src: thumbSrc,
-                                alt: `${w.name} 사진`,
-                                loading: "lazy",
-                                decoding: "async"
-                            })
-                        )
-                    )
-                } else
-                {
-                    strip.append(el("img", {
-                        class: "thumb",
-                        src: thumbSrc,
-                        alt: `${w.name} 사진`,
-                        loading: "lazy",
-                        decoding: "async",
-                        onClick: open
-                    }))
-                }
-            })
-
-            // 본문 조립 (authorAttr은 있을 때만 추가)
-            const body = el("div", { class: "body" },
-                titleLine,
-                stats1,
-                stats2,
-                capRow,
-                hpRow,
-                tagWrap,
-                desc,
-                strip
-            )
-
-            return el("article", { class: "card" }, hero, body)
-        }
-
-        function repeatString(s, n)
-        {
-            n = Math.floor(n)
-            if (!(n >= 0 && Number.isFinite(n)))
-            {
-                throw new RangeError('n은 0 이상의 유한한 정수여야 해')
-            }
-            const str = String(s)
-            if (typeof ''.repeat === 'function') return str.repeat(n) // 최신 엔진
-
-            // 폴백: 지수적 복제
-            let out = ''
-            let pat = str
-            while (n > 0)
-            {
-                if (n & 1) out += pat
-                n >>= 1
-                if (n) pat += pat
-            }
-            return out
-        }
-
+        // 프리로드
         const _precache = new Set()
         function preload(src) { if (!src || _precache.has(src)) return; const img = new Image(); img.decoding = "async"; img.src = src; _precache.add(src) }
         function preloadNeighbors(list, i)
         {
             const L = list.length; if (!L) return
             const idxs = [i - 1, i + 1, i - 2, i + 2].map(x => (x % L + L) % L)
-
             for (const j of idxs)
             {
                 const url = list[j]
                 const cached = _imgCache.get(url)
                 if (cached?.complete) continue
-
                 const img = cached instanceof Image ? cached : new Image()
                 img.decoding = "async"
-                // 이미 요청 중이면 src 재설정 안 해도 됨(브라우저가 중복 병합)
-                if (!cached)
-                {
-                    img.src = url
-                    _imgCache.set(url, img)
-                }
+                if (!cached) { img.src = url; _imgCache.set(url, img) }
             }
         }
         function preloadThumbNeighbors(thumbs, i)
@@ -507,90 +278,201 @@
             }
         }
 
-        function _applyFitByAspect(imgEl, w, h)
-        {
-            imgEl.classList.remove('portrait', 'landscape')
-            if (w > 0 && h > 0 && (w / h) < 1) imgEl.classList.add('portrait')
-            else imgEl.classList.add('landscape') // 정사각형은 가로 취급
-        }
-
-        // 스크롤 잠금: body 고정 + 스크롤 입력 차단(휠/터치/키)
-        // 스크롤 잠금: body 고정 + 스크롤 입력 차단(휠/터치/키)
+        // 스크롤 잠금
         const _scrollLock = { y: 0, wheel: null, touch: null, key: null }
-
         function lockScroll()
         {
-            const doc = document
-            const docEl = doc.documentElement
-
-            // ★ 현재 스크롤바 폭(px) 측정 → CSS 변수로 저장 (레이아웃 보정에 사용)
-            //  이 계산은 body를 고정시키기 "전에" 해야 정확함
+            const docEl = document.documentElement
             const sbw = Math.max(0, window.innerWidth - docEl.clientWidth)
             docEl.style.setProperty('--sbw', sbw + 'px')
-
             _scrollLock.y = window.scrollY || 0
             document.body.style.setProperty('--lock-top', `-${_scrollLock.y}px`)
-            document.body.classList.add('body-lock') // ← 여기서 body에 보정 패딩이 적용됨
-
-            // 스크롤 입력 차단
+            document.body.classList.add('body-lock')
             _scrollLock.wheel = (e) => { e.preventDefault() }
             _scrollLock.touch = (e) => { e.preventDefault() }
             _scrollLock.key = (e) =>
             {
                 const k = e.key
                 if (k === ' ' || k === 'PageUp' || k === 'PageDown' || k === 'Home' || k === 'End' ||
-                    k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight')
-                {
-                    e.preventDefault()
-                }
+                    k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') e.preventDefault()
             }
             window.addEventListener('wheel', _scrollLock.wheel, { passive: false })
             window.addEventListener('touchmove', _scrollLock.touch, { passive: false })
             window.addEventListener('keydown', _scrollLock.key, { passive: false })
         }
-
         function unlockScroll()
         {
-            // 입력 이벤트 해제
             if (_scrollLock.wheel) window.removeEventListener('wheel', _scrollLock.wheel)
             if (_scrollLock.touch) window.removeEventListener('touchmove', _scrollLock.touch)
             if (_scrollLock.key) window.removeEventListener('keydown', _scrollLock.key)
-
             document.body.classList.remove('body-lock')
             document.body.style.removeProperty('--lock-top')
-
-            // ★ 보정에 썼던 변수 원복
             document.documentElement.style.removeProperty('--sbw')
-
-            // 원래 위치 복귀
             window.scrollTo(0, _scrollLock.y || 0)
-
             _scrollLock.wheel = _scrollLock.touch = _scrollLock.key = null
         }
 
-        // 줄별로 .title-line 높이를 맞춰 속성 시작선을 정렬
+        function updateLbReserve()
+        {
+            const filmH = light.hasAttribute('open') ? (film?.offsetHeight || 0) : 0
+            const capH = cap?.offsetHeight || 0
+            const margin = 28
+            const reserve = Math.ceil(filmH + capH + margin)
+            document.documentElement.style.setProperty('--lb-reserve', reserve + 'px')
+        }
+
+        // -------- 카드/정렬 --------
+        function pct(fav, vis)
+        {
+            const v = Number(vis) || 0, f = Number(fav) || 0
+            if (v <= 0) return "0%"
+            let p = (f / v) * 100
+            if (!isFinite(p)) p = 0
+            p = Math.max(0, Math.min(100, p))
+            return (p >= 10 ? Math.round(p) : p.toFixed(1)) + "%"
+        }
+        function favRatioNum(w)
+        {
+            const v = Number(w.visits) || 0, f = Number(w.favorites) || 0
+            return v > 0 ? f / v : 0
+        }
+        function chips(tags)
+        {
+            if (!Array.isArray(tags)) return []
+            return tags.filter(t => t.startsWith("author_tag_"))
+                .map(t => t.replace(/^author_tag_/, ""))
+                .map(txt => el("span", { class: "chip" }, txt))
+        }
+        function toTs(v) { return typeof v === "number" ? v : (Date.parse(v || "") || 0) }
+        function repeatString(s, n)
+        {
+            n = Math.floor(n)
+            if (!(n >= 0 && Number.isFinite(n))) throw new RangeError('n은 0 이상의 유한한 정수여야 해')
+            const str = String(s)
+            if (typeof ''.repeat === 'function') return str.repeat(n)
+            let out = '', pat = str
+            while (n > 0) { if (n & 1) out += pat; n >>= 1; if (n) pat += pat }
+            return out
+        }
+
+        function card(w)
+        {
+            const url = w.url
+
+            // ⬇️ 히어로 이미지 우선순위 수정: API 썸네일 → previewThumb(로컬)
+            const heroImg = el("img", {
+                src: w.imageUrl || w.thumbnailImageUrl || w.previewThumb || "",
+                alt: `${w.name} 썸네일`,
+                loading: "lazy",
+                decoding: "async"
+            })
+            const hero = el("a", { class: "hero", href: url, target: "_blank", rel: "noopener noreferrer" }, heroImg)
+            hero.addEventListener("click", (ev) =>
+            {
+                if (ev.ctrlKey || ev.metaKey || ev.button === 1) return
+                ev.preventDefault()
+                openLight(w.id, 0, w.name || w.id) // 전체 사진 비동기 로드
+            })
+
+            const title = el("a", { href: url, target: "_blank", rel: "noopener noreferrer", class: "title" }, w.name || w.id)
+
+            let authorAttr = null
+            if (w.authorName)
+            {
+                const linkNode = w.authorId
+                    ? el("a", {
+                        href: `https://vrchat.com/home/user/${w.authorId}`,
+                        target: "_blank", rel: "noopener noreferrer", class: "author-link"
+                    }, w.authorName)
+                    : el("span", { class: "author-link" }, w.authorName)
+                authorAttr = el("div", { class: "author-attr" }, linkNode)
+            }
+
+            const titleLine = el("div", { class: "title-line" }, title, authorAttr)
+            const stats1 = el("div", { class: "stat-row" }, `방문 ${Number(w.visits || 0).toLocaleString("en-US")}`)
+
+            const ratio = (Number(w.visits) || 0) > 0 ? (Number(w.favorites) || 0) / Number(w.visits) : 0
+            const stats2 = el("div", { class: "stat-row favrow" },
+                el("span", {}, `즐겨찾기 ${Number(w.favorites || 0).toLocaleString("en-US")}`),
+                el("span", { class: "mini-pct" }, ((f, v) => { const p = v ? Math.max(0, Math.min(100, f / v * 100)) : 0; return (p >= 10 ? Math.round(p) : p.toFixed(1)) + "%" })(w.favorites, w.visits)),
+                (() =>
+                {
+                    const m = el("span", { class: "mini" }, el("span", { class: "mini-bar" }))
+                    m.querySelector(".mini-bar").style.setProperty("--ratio", String(Math.max(0, Math.min(1, ratio))))
+                    return m
+                })()
+            )
+
+            const capRow = el("div", { class: "meta" }, `최대 인원 ${w.capacity ?? "-"}`)
+            const repeatString = (s, n) => { n = Math.floor(n); if (!(n >= 0 && Number.isFinite(n))) throw new RangeError; let out = '', pat = String(s); while (n > 0) { if (n & 1) out += pat; n >>= 1; if (n) pat += pat } return out }
+            const hpRow = el("div", { class: "icons" },
+                el("span", { class: "icon" }, `${repeatString("🔥 ", Number(w.heat ?? 1))} `, String(w.heat ?? "-")),
+                el("span", { class: "icon" }, `${repeatString("⭐", Number(w.popularity ?? 1))} `, String(w.popularity ?? "-"))
+            )
+
+            const chips = (tags) => Array.isArray(tags) ? tags.filter(t => t.startsWith("author_tag_")).map(t => t.replace(/^author_tag_/, "")).map(txt => el("span", { class: "chip" }, txt)) : []
+            const tagWrap = el("div", { class: "tags" }, ...chips(w.tags))
+            const desc = el("p", { class: "desc" }, (w.description || "").trim())
+
+            // ---- 프리뷰 strip: 카드가 보일 때 사진 6장만 로드 (그대로) ----
+            const strip = el("div", { class: "strip" })
+            const PREVIEW_MAX = 6
+            const observer = new IntersectionObserver(async (entries, obs) =>
+            {
+                for (const ent of entries)
+                {
+                    if (!ent.isIntersecting) continue
+                    obs.unobserve(ent.target)
+                    try
+                    {
+                        const photos = await fetchPhotos(w.id, PREVIEW_MAX)
+                        if (!photos.length) return
+                        strip.innerHTML = ""
+                        photos.forEach((p, i) =>
+                        {
+                            const isLast = (i === PREVIEW_MAX - 1) && ((w.photoCount || 0) > PREVIEW_MAX)
+                            const open = () => openLight(w.id, i, w.name || w.id)
+                            const thumbSrc = p.thumb || p.full
+                            if (isLast)
+                            {
+                                const remain = (w.photoCount || 0) - PREVIEW_MAX + 1
+                                strip.append(
+                                    el("div", { class: "more", "data-more": "+ " + remain, role: "button", tabindex: "0", onClick: open },
+                                        el("img", { class: "thumb", src: thumbSrc, alt: `${w.name} 사진`, loading: "lazy", decoding: "async" })
+                                    )
+                                )
+                            } else
+                            {
+                                strip.append(el("img", {
+                                    class: "thumb", src: thumbSrc, alt: `${w.name} 사진`,
+                                    loading: "lazy", decoding: "async", onClick: open
+                                }))
+                            }
+                        })
+                    } catch { }
+                }
+            }, { rootMargin: "200px" })
+            queueMicrotask(() => observer.observe(strip))
+
+            const body = el("div", { class: "body" },
+                titleLine, stats1, stats2, capRow, hpRow, tagWrap, desc, strip
+            )
+            return el("article", { class: "card" }, hero, body)
+        }
+
+        // 줄별 .title-line 높이 정렬
         function alignTitleHeights()
         {
             const cards = Array.from(grid.querySelectorAll('.card'))
             if (!cards.length) return
-
-            // 기존 minHeight 리셋
-            for (const c of cards)
-            {
-                const t = c.querySelector('.title-line')
-                if (t) t.style.minHeight = ''
-            }
-
-            // 같은 줄 묶기: offsetTop이 같은 카드 = 같은 행
+            for (const c of cards) { const t = c.querySelector('.title-line'); if (t) t.style.minHeight = '' }
             const rows = new Map()
             for (const c of cards)
             {
-                const y = c.offsetTop                 // 정수라 그룹핑에 충분
+                const y = c.offsetTop
                 if (!rows.has(y)) rows.set(y, [])
                 rows.get(y).push(c)
             }
-
-            // 각 행에서 제목 블록 최대 높이를 찾아 일괄 적용
             for (const group of rows.values())
             {
                 let maxH = 100
@@ -611,25 +493,15 @@
                 }
             }
         }
-
-        // 리사이즈/폰트 로드 후도 다시 맞춤
         const alignTitleHeightsDebounced = (() =>
         {
             let tid = null
-            return () =>
-            {
-                clearTimeout(tid)
-                tid = setTimeout(() =>
-                {
-                    requestAnimationFrame(alignTitleHeights)
-                }, 80)
-            }
+            return () => { clearTimeout(tid); tid = setTimeout(() => requestAnimationFrame(alignTitleHeights), 80) }
         })()
         window.addEventListener('resize', alignTitleHeightsDebounced)
         document.fonts?.ready?.then(() => alignTitleHeights())
 
-
-        /* 정렬 & 렌더 */
+        // -------- 정렬/렌더 --------
         function render()
         {
             grid.innerHTML = ""
@@ -657,45 +529,35 @@
             STATE.sort = sortSel.value
             localStorage.setItem("sort", STATE.sort)
             render()
-        });
+        })
 
-        /* 데이터 로드 */
-        (async () =>
-        {
-            status.textContent = "월드 목록을 불러오는 중…"
-            try
+            // -------- 데이터 로드 --------
+            ; (async () =>
             {
-                const r = await fetch("/api/worlds")
-                if (!r.ok) throw new Error("HTTP " + r.status)
-                const { worlds } = await r.json()
-                STATE.worlds = worlds
-                status.textContent = ""
-                render()
-            } catch (e)
-            {
-                status.textContent = "불러오기 실패: " + e.message
-            }
-        })()
+                status.textContent = "월드 목록을 불러오는 중…"
+                try
+                {
+                    const r = await fetch("/api/worlds", { headers: { "Cache-Control": "no-cache" } })
+                    if (r.status === 304) { status.textContent = ""; return }
+                    if (!r.ok) throw new Error("HTTP " + r.status)
+                    const { worlds } = await r.json()
+                    STATE.worlds = worlds
+                    status.textContent = ""
+                    render()
+                } catch (e)
+                {
+                    status.textContent = "불러오기 실패: " + (e?.message || e)
+                }
+            })()
 
-        // 전역 단축키: 팝업이 열려 있을 때만 동작
+        // 전역 키 바인딩 (라이트박스 열렸을 때만)
         function onKeyGlobal(e)
         {
             if (!light.hasAttribute("open")) return
-            if (e.key === "Escape")
-            {
-                e.preventDefault()
-                closeLight()
-            } else if (e.key === "ArrowLeft")
-            {
-                e.preventDefault()
-                move(-1)
-            } else if (e.key === "ArrowRight")
-            {
-                e.preventDefault()
-                move(1)
-            }
+            if (e.key === "Escape") { e.preventDefault(); closeLight() }
+            else if (e.key === "ArrowLeft") { e.preventDefault(); move(-1) }
+            else if (e.key === "ArrowRight") { e.preventDefault(); move(1) }
         }
-
         window.addEventListener("keydown", onKeyGlobal)
 
         let _lbRsvTid = null
